@@ -65,6 +65,9 @@ HEADERS = {
 
 def fetch_team_page():
     resp = requests.get(TEAM_URL, headers=HEADERS, timeout=20)
+    print(f"DEBUG: HTTP status = {resp.status_code}")
+    print(f"DEBUG: HTML length = {len(resp.text)}")
+    print(f"DEBUG: HTML start = {resp.text[:500]!r}")
     resp.raise_for_status()
     return resp.text
 
