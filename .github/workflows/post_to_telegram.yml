@@ -1,0 +1,53 @@
+name: post-to-telegram
+
+on:
+  schedule:
+    # Время в UTC. 07:00 UTC = 10:00 МСК.
+    - cron: '0 7 * * 1'   # понедельник -> анонс игр на неделю
+    - cron: '0 7 * * 5'   # пятница -> итоги игр за неделю
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим: announce или recap'
+        required: true
+        default: 'announce'
+        type: choice
+        options:
+          - announce
+          - recap
+      dry_run:
+        description: 'Не отправлять в Telegram, только показать текст в логе'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 7 * * 1" ]; then
+            echo "mode=announce" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 7 * * 5" ]; then
+            echo "mode=recap" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=${{ github.event.inputs.mode || 'announce' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '1' || '' }}
+        run: python bot.py --mode ${{ steps.mode.outputs.mode }}
+
