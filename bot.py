@@ -27,6 +27,7 @@
 import os
 import re
 import sys
+import json
 import argparse
 from datetime import datetime, timedelta, timezone
 
@@ -103,7 +104,8 @@ def parse_card(a_tag, now):
     if not lines:
         return None
 
-    href = a_tag.get("href", "")
+    href_path = a_tag.get("href", "")
+    href = href_path
     if href and not href.startswith("http"):
         href = "https://ablforpeople.com" + href
 
@@ -175,6 +177,7 @@ def parse_card(a_tag, now):
         "score_b": score_b,
         "round": round_label,
         "url": href,
+        "href_path": href_path,
     }
 
 
@@ -208,7 +211,7 @@ def fmt_date(dt):
     return f"{dt.day} {RU_MONTHS_NOM[dt.month]}"
 
 
-def build_announce_text(games):
+def select_upcoming(games):
     now = datetime.now(MSK)
     window_end = now + timedelta(days=7)
     upcoming = [
@@ -216,6 +219,68 @@ def build_announce_text(games):
         if team_involved(g) and is_upcoming(g) and now <= g["datetime"] <= window_end
     ]
     upcoming.sort(key=lambda g: g["datetime"])
+    return upcoming
+
+
+def select_played(games):
+    now = datetime.now(MSK)
+    window_start = now - timedelta(days=7)
+    played = [
+        g for g in games
+        if team_involved(g) and not is_upcoming(g) and window_start <= g["datetime"] <= now
+    ]
+    played.sort(key=lambda g: g["datetime"])
+    return played
+
+
+def game_caption_announce(g):
+    opponent = g["team_b"] if g["team_a"] == TEAM_NAME else g["team_a"]
+    return (
+        f"🏀 {TEAM_NAME} — {opponent}\n"
+        f"📅 {fmt_date(g['datetime'])}, {g['datetime'].strftime('%H:%M')} МСК\n"
+        f"🏆 {g['round']} ({g['division']})\n\n"
+        f"Приходите поддержать «{TEAM_NAME}»! 🐾\n"
+        f"{g['url']}"
+    )
+
+
+def game_caption_recap(g):
+    if g["team_a"] == TEAM_NAME:
+        our_score, opp_score, opponent = g["score_a"], g["score_b"], g["team_b"]
+    else:
+        our_score, opp_score, opponent = g["score_b"], g["score_a"], g["team_a"]
+
+    if our_score > opp_score:
+        result = "🟢 Победа"
+    elif our_score < opp_score:
+        result = "🔴 Поражение"
+    else:
+        result = "⚪ Ничья"
+
+    return (
+        f"{result}\n"
+        f"🏀 {TEAM_NAME} {our_score}:{opp_score} {opponent}\n"
+        f"🏆 {g['round']} ({g['division']}) · {fmt_date(g['datetime'])}\n"
+        f"{g['url']}\n\n"
+        f"#БурыеРыси #ABL"
+    )
+
+
+def build_announce_items(games):
+    """Список (игра, подпись) для всех предстоящих игр на ближайшие 7 дней --
+    по одной карточке-фото на каждую игру."""
+    return [(g, game_caption_announce(g)) for g in select_upcoming(games)]
+
+
+def build_recap_items(games):
+    """Список (игра, подпись) для всех сыгранных за последние 7 дней игр."""
+    return [(g, game_caption_recap(g)) for g in select_played(games)]
+
+
+def build_announce_text(games):
+    """Текстовый fallback (без фото) на случай, если скриншот карточки
+    не удался -- чтобы канал всё равно получил анонс."""
+    upcoming = select_upcoming(games)
     if not upcoming:
         return None
 
@@ -244,39 +309,39 @@ def build_announce_text(games):
 
 
 def build_recap_text(games):
-    now = datetime.now(MSK)
-    window_start = now - timedelta(days=7)
-    played = [
-        g for g in games
-        if team_involved(g) and not is_upcoming(g) and window_start <= g["datetime"] <= now
-    ]
-    played.sort(key=lambda g: g["datetime"])
+    """Текстовый fallback (без фото) на случай, если скриншот карточки
+    не удался -- чтобы канал всё равно получил дайджест итогов."""
+    played = select_played(games)
     if not played:
         return None
+    # game_caption_recap() уже содержит хэштеги в конце -- для сводки из
+    # нескольких игр оставляем их только один раз, в конце всего текста.
+    blocks = [game_caption_recap(g).rsplit("\n\n#БурыеРыси #ABL", 1)[0] for g in played]
+    return "\n\n".join(blocks) + "\n\n#БурыеРыси #ABL"
 
-    blocks = []
-    for g in played:
-        if g["team_a"] == TEAM_NAME:
-            our_score, opp_score, opponent = g["score_a"], g["score_b"], g["team_b"]
-        else:
-            our_score, opp_score, opponent = g["score_b"], g["score_a"], g["team_a"]
 
-        if our_score > opp_score:
-            result = "🟢 Победа"
-        elif our_score < opp_score:
-            result = "🔴 Поражение"
-        else:
-            result = "⚪ Ничья"
+def screenshot_game_card(href_path, timeout_ms=30000):
+    """Сделать скриншот именно того блока на странице команды, который
+    соответствует игре с данным href (например "/game/159011").
 
-        blocks.append(
-            f"{result}\n"
-            f"🏀 {TEAM_NAME} {our_score}:{opp_score} {opponent}\n"
-            f"🏆 {g['round']} ({g['division']}) · {fmt_date(g['datetime'])}\n"
-            f"{g['url']}"
-        )
+    Специально не рисуем карточку сами (шрифты/цвета/лого пришлось бы
+    поддерживать вручную), а вместо этого открываем реальную страницу ABL в
+    headless-браузере и вырезаем нужный элемент -- так фото всегда будет
+    выглядеть так же, как на сайте, даже если ABL поменяет вёрстку/дизайн.
+    """
+    from playwright.sync_api import sync_playwright
 
-    text = "\n\n".join(blocks) + f"\n\n#БурыеРыси #ABL"
-    return text
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 1600})
+            page.goto(TEAM_URL, wait_until="networkidle", timeout=timeout_ms)
+            locator = page.locator(f'a[href="{href_path}"]').first
+            locator.wait_for(state="visible", timeout=timeout_ms)
+            locator.scroll_into_view_if_needed()
+            return locator.screenshot()
+        finally:
+            browser.close()
 
 
 def send_telegram_message(token, text):
@@ -290,6 +355,10 @@ def send_telegram_message(token, text):
         },
         timeout=20,
     )
+    _check_telegram_response(resp)
+
+
+def _check_telegram_response(resp):
     ok = False
     try:
         data = resp.json()
@@ -301,6 +370,39 @@ def send_telegram_message(token, text):
     resp.raise_for_status()
     if not ok:
         sys.exit(1)
+
+
+def send_telegram_photo(token, photo_bytes, caption):
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    resp = requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT, "caption": caption},
+        files={"photo": ("game.png", photo_bytes, "image/png")},
+        timeout=30,
+    )
+    _check_telegram_response(resp)
+
+
+def send_telegram_media_group(token, items):
+    """items: список (photo_bytes, caption); отправляется одним альбомом,
+    у каждой фотографии своя подпись. Telegram ограничивает альбом 2-10
+    вложениями, поэтому лишнее обрезаем (маловероятный край случая)."""
+    items = items[:10]
+    media = []
+    files = {}
+    for i, (photo_bytes, caption) in enumerate(items):
+        key = f"file{i}"
+        media.append({"type": "photo", "media": f"attach://{key}", "caption": caption})
+        files[key] = (f"{key}.png", photo_bytes, "image/png")
+
+    url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+    resp = requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT, "media": json.dumps(media, ensure_ascii=False)},
+        files=files,
+        timeout=60,
+    )
+    _check_telegram_response(resp)
 
 
 def main():
@@ -324,23 +426,65 @@ def main():
     print(f"Parsed {len(games)} game cards from team page.")
 
     if args.mode == "announce":
-        text = build_announce_text(games)
+        items = build_announce_items(games)
+        fallback_text = build_announce_text(games)
     else:
-        text = build_recap_text(games)
+        items = build_recap_items(games)
+        fallback_text = build_recap_text(games)
 
-    if not text:
+    if not items:
         print(f"No content to post for mode={args.mode}. Skipping (safe default, nothing sent).")
         return
 
-    print("----- POST TEXT -----")
-    print(text)
+    print("----- POST ITEMS -----")
+    for g, caption in items:
+        print(f"* {g['url']}")
+        print(caption)
+        print()
     print("----------------------")
 
+    # Скриншоты делаем всегда, в том числе и при DRY_RUN=1 -- так можно
+    # проверить, что вырезка карточки с сайта реально работает, ещё до того
+    # как что-то уйдёт в Telegram. Сохраняем их в screenshots/, чтобы файлы
+    # можно было посмотреть как артефакт запуска workflow.
+    os.makedirs("screenshots", exist_ok=True)
+    photos = []
+    for i, (g, caption) in enumerate(items):
+        try:
+            photo_bytes = screenshot_game_card(g["href_path"])
+            fname = f"screenshots/{i:02d}_{g['href_path'].strip('/').replace('/', '_')}.png"
+            with open(fname, "wb") as f:
+                f.write(photo_bytes)
+            print(f"Screenshot OK: {g['url']} -> {fname} ({len(photo_bytes)} bytes)")
+        except Exception as e:
+            print(f"WARN: failed to screenshot card for {g['url']}: {e}", file=sys.stderr)
+            photo_bytes = None
+        photos.append((photo_bytes, caption))
+
     if dry_run:
-        print("DRY_RUN=1: сообщение НЕ отправлено в Telegram.")
+        print("DRY_RUN=1: сообщение(-я) НЕ отправлены в Telegram.")
         return
 
-    send_telegram_message(token, text)
+    if all(p is None for p, _ in photos):
+        # Скриншот совсем не удался (например, сайт изменил вёрстку и
+        # селектор перестал находить карточку) -- отправляем обычный текст,
+        # чтобы канал всё равно получил анонс/дайджест.
+        print("WARN: all screenshots failed, falling back to text-only message.", file=sys.stderr)
+        send_telegram_message(token, fallback_text)
+    elif len(photos) == 1:
+        photo_bytes, caption = photos[0]
+        if photo_bytes:
+            send_telegram_photo(token, photo_bytes, caption)
+        else:
+            send_telegram_message(token, caption)
+    else:
+        media_items = [(p, c) for p, c in photos if p]
+        text_only = [c for p, c in photos if not p]
+        if media_items:
+            send_telegram_media_group(token, media_items)
+        for c in text_only:
+            send_telegram_message(token, c)
+
     print("Sent to Telegram OK.")
 
 
