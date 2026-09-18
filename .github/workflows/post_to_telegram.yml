@@ -2,9 +2,9 @@ name: post-to-telegram
 
 on:
   schedule:
-    # Время в UTC. 07:00 UTC = 10:00 МСК.
-    - cron: '0 7 * * 1'   # понедельник -> анонс игр на неделю
-    - cron: '0 7 * * 5'   # пятница -> итоги игр за неделю
+    # Время в UTC (МСК = UTC+3, без перехода на летнее/зимнее время).
+    - cron: '0 15 * * 5'  # пятница 18:00 МСК -> анонс игры(игр) на выходные
+    - cron: '0 10 * * 1'  # понедельник 13:00 МСК -> итоги прошедшей игры (с фото)
   workflow_dispatch:
     inputs:
       mode:
@@ -39,9 +39,9 @@ jobs:
       - name: Determine mode
         id: mode
         run: |
-          if [ "${{ github.event.schedule }}" = "0 7 * * 1" ]; then
+          if [ "${{ github.event.schedule }}" = "0 15 * * 5" ]; then
             echo "mode=announce" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 7 * * 5" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 10 * * 1" ]; then
             echo "mode=recap" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode || 'announce' }}" >> "$GITHUB_OUTPUT"
