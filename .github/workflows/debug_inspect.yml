@@ -1,0 +1,34 @@
+name: debug-inspect-protocol
+
+# Разовый диагностический workflow -- НЕ часть расписания бота.
+# Запускается только вручную (workflow_dispatch), просто открывает
+# страницу /protocol конкретной игры настоящим браузером и печатает в
+# лог всё, что там реально есть, чтобы понять, как устроена статистика
+# по игрокам на сайте ABL. После того как разберёмся -- можно удалить
+# этот файл и inspect_protocol.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL страницы /protocol конкретной игры'
+        required: true
+        default: 'https://ablforpeople.com/game/158253/protocol'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Inspect protocol page
+        run: python inspect_protocol.py "${{ github.event.inputs.url }}"
