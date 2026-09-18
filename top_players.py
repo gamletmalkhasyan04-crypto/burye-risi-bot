@@ -124,24 +124,49 @@ def find_header_anchors(lines):
     return anchors
 
 
+def _try_values(lines, s):
+    """Проверить, что lines[s:s+ROW_LEN] -- валидный набор значений строки
+    игрока (по типу каждой колонки). Вернуть dict или None."""
+    if s + ROW_LEN > len(lines):
+        return None
+    values = lines[s: s + ROW_LEN]
+    for (col_name, pattern), val in zip(COLUMNS, values):
+        if not re.match(pattern, val):
+            return None
+    return {col_name: val for (col_name, _), val in zip(COLUMNS, values)}
+
+
 def parse_player_row(lines, start):
     """Попробовать разобрать строку игрока начиная с lines[start] (имя).
-    Вернуть (player_dict, следующий_индекс) или None, если не подошло."""
+    Вернуть (player_dict, следующий_индекс) или None, если не подошло.
+
+    На странице ABL у ЧАСТИ игроков после имени идёт ещё строка с амплуа
+    ("Разыгрывающий защитник", "Легкий форвард" и т.п.), у остальных --
+    нет. Поэтому пробуем сначала без неё, а если не сошлось по типам --
+    считаем следующую строку амплуа и пробуем ещё раз, сдвинувшись на 1.
+    """
     if start >= len(lines):
         return None
     name = lines[start]
     if not NAME_LIKE_RE.match(name):
         return None
-    if start + 1 + ROW_LEN > len(lines):
-        return None
-    values = lines[start + 1: start + 1 + ROW_LEN]
-    for (col_name, pattern), val in zip(COLUMNS, values):
-        if not re.match(pattern, val):
-            return None
-    row = {"name": name}
-    for (col_name, _), val in zip(COLUMNS, values):
-        row[col_name] = val
-    return row, start + 1 + ROW_LEN
+
+    stats = _try_values(lines, start + 1)
+    if stats is not None:
+        row = {"name": name}
+        row.update(stats)
+        return row, start + 1 + ROW_LEN
+
+    # Возможно, lines[start + 1] -- строка амплуа (не число, не проценты,
+    # не мм:сс) -- пробуем пропустить её и разобрать статистику дальше.
+    if start + 1 < len(lines) and not re.match(COLUMNS[0][1], lines[start + 1]):
+        stats = _try_values(lines, start + 2)
+        if stats is not None:
+            row = {"name": name, "position": lines[start + 1]}
+            row.update(stats)
+            return row, start + 2 + ROW_LEN
+
+    return None
 
 
 def parse_team_block(lines, header_idx, stop_before):
