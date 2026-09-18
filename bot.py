@@ -31,7 +31,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 TEAM_ID = 13921
 TEAM_NAME = "Бурые Рыси"
@@ -51,7 +51,12 @@ RU_MONTHS_NOM = {
     9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
 
-DATE_RE = re.compile(r"(\d{1,2})\s+([а-яёА-ЯЁ]+),(\d{1,2}):(\d{2})")
+
+# ABL сейчас рендерит дату и время как ДВА отдельных текстовых узла
+# ("19 сентября," и "18:20"), а не одной строкой "19 сентября,18:20" --
+# поэтому дата и время матчатся отдельными regex-ами по соседним строкам.
+DATE_RE = re.compile(r"^(\d{1,2})\s+([а-яёА-ЯЁ]+),?$")
+TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 ROUND_RE = re.compile(r"^\d+\s*тур", re.IGNORECASE)
 SCORE_RE = re.compile(r"^(\d{1,3}):(\d{1,3})$")
 
@@ -72,9 +77,29 @@ def fetch_team_page():
     return resp.text
 
 
+def extract_lines(a_tag):
+    """Собрать текстовые "строки" карточки матча в порядке появления.
+
+    Названия команд в вёрстке ABL -- это лого, т.е. <img alt="Название">,
+    а не текст. Обычный a_tag.get_text() такие узлы полностью
+    игнорирует, поэтому команды нужно доставать отдельно из alt
+    у <img>, вперемешку с обычными текстовыми узлами.
+    """
+    parts = []
+    for desc in a_tag.descendants:
+        if isinstance(desc, NavigableString):
+            t = str(desc).strip()
+            if t:
+                parts.append(t)
+        elif getattr(desc, "name", None) == "img":
+            alt = (desc.get("alt") or "").strip()
+            if alt:
+                parts.append(alt)
+    return parts
+
+
 def parse_card(a_tag, now):
-    text = a_tag.get_text(separator="\n", strip=True)
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    lines = extract_lines(a_tag)
     if not lines:
         return None
 
@@ -83,15 +108,17 @@ def parse_card(a_tag, now):
         href = "https://ablforpeople.com" + href
 
     date_idx = None
-    for i, l in enumerate(lines):
-        if DATE_RE.search(l):
+    for i in range(len(lines) - 1):
+        if DATE_RE.match(lines[i]) and TIME_RE.match(lines[i + 1]):
             date_idx = i
             break
     if date_idx is None:
         return None
 
-    m = DATE_RE.search(lines[date_idx])
-    day, month_name, hh, mm = m.groups()
+    dm = DATE_RE.match(lines[date_idx])
+    tm = TIME_RE.match(lines[date_idx + 1])
+    day, month_name = dm.groups()
+    hh, mm = tm.groups()
     month = RU_MONTHS.get(month_name.lower())
     if not month:
         return None
@@ -110,7 +137,7 @@ def parse_card(a_tag, now):
 
     division = lines[0] if date_idx >= 1 else ""
 
-    rest = lines[date_idx + 1:]
+    rest = lines[date_idx + 2:]
     round_idx = None
     for i, l in enumerate(rest):
         if ROUND_RE.match(l):
