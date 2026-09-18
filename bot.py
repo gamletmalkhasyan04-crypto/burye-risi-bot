@@ -4,8 +4,10 @@
 Бот для автопостинга новостей БК "Бурые Рыси" (ABL, ablforpeople.com) в Telegram-канал.
 
 Режимы:
-  --mode announce  -> анонс игр на ближайшие 7 дней (пн)
-  --mode recap     -> итоги игр за последние 7 дней (пт)
+  --mode announce  -> анонс игр на ближайшие 7 дней (пятница)
+  --mode recap     -> итоги игр за последние 7 дней + топ-3 игрока
+                      "Бурые Рыси" по каждой игре, по данным со страницы
+                      /protocol (понедельник)
 
 Переменные окружения:
   TELEGRAM_BOT_TOKEN  -- токен бота (обязательно)
@@ -38,6 +40,7 @@ TEAM_ID = 13921
 TEAM_NAME = "Бурые Рыси"
 TEAM_URL = f"https://ablforpeople.com/team/{TEAM_ID}"
 TELEGRAM_CHAT = "@burye_risi"
+TOP_PLAYERS_N = 3
 
 MSK = timezone(timedelta(hours=3))
 
@@ -67,6 +70,163 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
 }
+
+# ----------------------------------------------------------------------------
+# Разбор статистики игроков со страницы /protocol (для recap).
+#
+# Логика перенесена и проверена в top_players.py на реальном логе
+# debug-inspect-protocol (игра 158253) -- см. историю там же для деталей.
+# У ABL нет <table> в вёрстке, только плоский видимый текст страницы, где
+# на каждую из двух команд идёт: [Название команды], 26 строк-подписей
+# колонок (HEADER_ANCHOR), строка-итог команды, затем строки игроков
+# (иногда с необязательной строкой амплуа между именем и статистикой).
+# ----------------------------------------------------------------------------
+
+PLAYER_STATS_HEADER_ANCHOR = [
+    "Очки",
+    "2 ОЧКА", "Поп.", "Брос.", "%",
+    "3 ОЧКА", "Поп.", "Брос.", "%",
+    "ШТРАФНОЙ", "Поп.", "Брос.", "%",
+    "ПОДБОР", "Напад.", "Защ.", "Всего",
+    "Передачи", "Блоки", "Перехваты", "Потери",
+    "Фолы", "Фолы соперника",
+    "Эффектив.", "Мин.", "+-",
+]
+
+PLAYER_STATS_COLUMNS = [
+    ("pts", r"^-?\d+$"),
+    ("fg2_m", r"^\d+$"), ("fg2_a", r"^\d+$"), ("fg2_pct", r"^(\d+(\.\d+)?%|-)$"),
+    ("fg3_m", r"^\d+$"), ("fg3_a", r"^\d+$"), ("fg3_pct", r"^(\d+(\.\d+)?%|-)$"),
+    ("ft_m", r"^\d+$"), ("ft_a", r"^\d+$"), ("ft_pct", r"^(\d+(\.\d+)?%|-)$"),
+    ("reb_off", r"^\d+$"), ("reb_def", r"^\d+$"), ("reb_tot", r"^\d+$"),
+    ("ast", r"^\d+$"), ("blk", r"^\d+$"), ("stl", r"^\d+$"), ("tov", r"^\d+$"),
+    ("pf", r"^\d+$"), ("pf_drawn", r"^\d+$"),
+    ("eff", r"^-?\d+$"),
+    ("min", r"^\d{1,3}:\d{2}$|^-$"),
+    ("plus_minus", r"^[+-]?\d+$"),
+]
+PLAYER_STATS_ROW_LEN = len(PLAYER_STATS_COLUMNS)  # 22
+
+PLAYER_NAME_RE = re.compile(r"^[А-ЯЁA-Z][а-яёa-zА-ЯЁA-Z\-.\s]+$")
+
+
+def find_player_stats_header_anchors(lines):
+    n = len(PLAYER_STATS_HEADER_ANCHOR)
+    return [
+        i for i in range(len(lines) - n + 1)
+        if lines[i:i + n] == PLAYER_STATS_HEADER_ANCHOR
+    ]
+
+
+def _try_player_stats_values(lines, s):
+    if s + PLAYER_STATS_ROW_LEN > len(lines):
+        return None
+    values = lines[s: s + PLAYER_STATS_ROW_LEN]
+    for (col_name, pattern), val in zip(PLAYER_STATS_COLUMNS, values):
+        if not re.match(pattern, val):
+            return None
+    return {col_name: val for (col_name, _), val in zip(PLAYER_STATS_COLUMNS, values)}
+
+
+def parse_player_stats_row(lines, start):
+    """Строка игрока = имя [+ необязательная строка амплуа] + 22 значения."""
+    if start >= len(lines):
+        return None
+    name = lines[start]
+    if not PLAYER_NAME_RE.match(name):
+        return None
+
+    stats = _try_player_stats_values(lines, start + 1)
+    if stats is not None:
+        return {"name": name, **stats}, start + 1 + PLAYER_STATS_ROW_LEN
+
+    if start + 1 < len(lines) and not re.match(PLAYER_STATS_COLUMNS[0][1], lines[start + 1]):
+        stats = _try_player_stats_values(lines, start + 2)
+        if stats is not None:
+            return {"name": name, **stats}, start + 2 + PLAYER_STATS_ROW_LEN
+
+    return None
+
+
+def parse_player_stats_team_block(lines, header_idx, stop_before):
+    team_name = lines[header_idx - 1] if header_idx > 0 else "?"
+    j = header_idx + len(PLAYER_STATS_HEADER_ANCHOR)
+    players = []
+    scan_limit = min(stop_before, len(lines))
+    while j < scan_limit:
+        parsed = parse_player_stats_row(lines, j)
+        if parsed:
+            player, j = parsed
+            players.append(player)
+        else:
+            j += 1
+    return team_name, players
+
+
+def parse_protocol_player_stats(lines):
+    """Вернуть {название_команды: [игроки]} для обеих команд, либо кинуть
+    RuntimeError, если якоря-заголовки не нашлись (сайт поменял вёрстку)."""
+    anchors = find_player_stats_header_anchors(lines)
+    if len(anchors) < 2:
+        raise RuntimeError(
+            f"не нашёл 2 блока статистики команд на /protocol (нашёл {len(anchors)})"
+        )
+    teams = {}
+    for idx, header_idx in enumerate(anchors):
+        stop_before = anchors[idx + 1] - 1 if idx + 1 < len(anchors) else len(lines)
+        team_name, players = parse_player_stats_team_block(lines, header_idx, stop_before)
+        teams[team_name] = players
+    return teams
+
+
+def pick_top_players(players, top_n=TOP_PLAYERS_N):
+    return sorted(players, key=lambda p: (int(p["eff"]), int(p["pts"])), reverse=True)[:top_n]
+
+
+TOP_PLAYER_MEDALS = ["🥇", "🥈", "🥉", "4.", "5."]
+
+
+def fetch_top_players_block(game_url, timeout_ms=30000):
+    """Открыть /protocol данной игры и вернуть готовый текстовый блок
+    "Топ-3 игрока: ..." для TEAM_NAME, либо None, если что-то пошло не так
+    (страница не открылась, не нашли команду и т.п.) -- recap в этом
+    случае просто уйдёт без блока статистики, а не сломается целиком."""
+    from playwright.sync_api import sync_playwright
+
+    protocol_url = game_url.rstrip("/") + "/protocol"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page(viewport={"width": 1400, "height": 2000})
+                page.goto(protocol_url, wait_until="networkidle", timeout=timeout_ms)
+                page.wait_for_timeout(3000)
+                text = page.inner_text("body")
+            finally:
+                browser.close()
+
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        teams = parse_protocol_player_stats(lines)
+        our_players = teams.get(TEAM_NAME)
+        if not our_players:
+            print(
+                f"WARN: команда '{TEAM_NAME}' не найдена в статистике {protocol_url} "
+                f"(нашлись: {list(teams.keys())})",
+                file=sys.stderr,
+            )
+            return None
+
+        top = pick_top_players(our_players)
+        out = [f"⭐ Топ-{len(top)} игрока «{TEAM_NAME}»:"]
+        for medal, p in zip(TOP_PLAYER_MEDALS, top):
+            out.append(
+                f"{medal} {p['name']} — {p['pts']} очк., {p['reb_tot']} подб., "
+                f"{p['ast']} пер., эфф. {p['eff']}"
+            )
+        return "\n".join(out)
+    except Exception as e:
+        print(f"WARN: не удалось получить статистику игроков для {protocol_url}: {e}", file=sys.stderr)
+        return None
 
 
 def fetch_team_page():
@@ -244,7 +404,7 @@ def game_caption_announce(g):
     )
 
 
-def game_caption_recap(g):
+def game_caption_recap(g, stats_block=None):
     if g["team_a"] == TEAM_NAME:
         our_score, opp_score, opponent = g["score_a"], g["score_b"], g["team_b"]
     else:
@@ -257,13 +417,13 @@ def game_caption_recap(g):
     else:
         result = "⚪ Ничья"
 
-    return (
+    header = (
         f"{result}\n"
         f"🏀 {TEAM_NAME} {our_score}:{opp_score} {opponent}\n"
-        f"🏆 {g['round']} ({g['division']}) · {fmt_date(g['datetime'])}\n"
-        f"{g['url']}\n\n"
-        f"#БурыеРыси #ABL"
+        f"🏆 {g['round']} ({g['division']}) · {fmt_date(g['datetime'])}"
     )
+    stats_part = f"\n\n{stats_block}" if stats_block else ""
+    return f"{header}{stats_part}\n\n{g['url']}\n\n#БурыеРыси #ABL"
 
 
 def build_announce_items(games):
@@ -273,8 +433,15 @@ def build_announce_items(games):
 
 
 def build_recap_items(games):
-    """Список (игра, подпись) для всех сыгранных за последние 7 дней игр."""
-    return [(g, game_caption_recap(g)) for g in select_played(games)]
+    """Список (игра, подпись) для всех сыгранных за последние 7 дней игр.
+    Для каждой игры дополнительно пытаемся достать топ-3 игрока "Бурые
+    Рыси" со страницы /protocol -- если не получится, подпись просто
+    уйдёт без этого блока (см. fetch_top_players_block)."""
+    items = []
+    for g in select_played(games):
+        stats_block = fetch_top_players_block(g["url"])
+        items.append((g, game_caption_recap(g, stats_block)))
+    return items
 
 
 def build_announce_text(games):
@@ -308,15 +475,18 @@ def build_announce_text(games):
     return "\n".join(lines)
 
 
-def build_recap_text(games):
+def build_recap_fallback_text(items):
     """Текстовый fallback (без фото) на случай, если скриншот карточки
-    не удался -- чтобы канал всё равно получил дайджест итогов."""
-    played = select_played(games)
-    if not played:
+    не удался -- чтобы канал всё равно получил дайджест итогов.
+
+    Принимает уже собранные (game, caption) из build_recap_items(), а не
+    сами games -- иначе пришлось бы второй раз ходить на /protocol за
+    статистикой игроков для каждой игры."""
+    if not items:
         return None
     # game_caption_recap() уже содержит хэштеги в конце -- для сводки из
     # нескольких игр оставляем их только один раз, в конце всего текста.
-    blocks = [game_caption_recap(g).rsplit("\n\n#БурыеРыси #ABL", 1)[0] for g in played]
+    blocks = [caption.rsplit("\n\n#БурыеРыси #ABL", 1)[0] for _, caption in items]
     return "\n\n".join(blocks) + "\n\n#БурыеРыси #ABL"
 
 
@@ -430,7 +600,7 @@ def main():
         fallback_text = build_announce_text(games)
     else:
         items = build_recap_items(games)
-        fallback_text = build_recap_text(games)
+        fallback_text = build_recap_fallback_text(items)
 
     if not items:
         print(f"No content to post for mode={args.mode}. Skipping (safe default, nothing sent).")
