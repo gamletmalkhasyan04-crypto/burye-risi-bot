@@ -156,7 +156,12 @@ def collect_games(html):
     now = datetime.now(MSK)
     games = []
     seen_urls = set()
-    for a in soup.find_all("a", href=re.compile(r"/game/\d+")):
+    candidates = soup.find_all("a", href=re.compile(r"/game/\d+"))
+    print(f"DEBUG: found {len(candidates)} candidate <a> tags")
+    for i, a in enumerate(candidates[:5]):
+        print(f"DEBUG: candidate {i} href={a.get('href')!r}")
+        print(f"DEBUG: candidate {i} text={a.get_text(separator=' | ', strip=True)!r}")
+    for a in candidates:
         g = parse_card(a, now)
         if g and g["url"] not in seen_urls:
             seen_urls.add(g["url"])
