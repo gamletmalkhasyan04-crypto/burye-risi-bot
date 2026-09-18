@@ -32,7 +32,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install requests beautifulsoup4 playwright
+          playwright install --with-deps chromium
 
       - name: Determine mode
         id: mode
@@ -51,3 +53,11 @@ jobs:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '1' || '' }}
         run: python bot.py --mode ${{ steps.mode.outputs.mode }}
 
+      - name: Upload screenshots (for preview/debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: game-card-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 14
