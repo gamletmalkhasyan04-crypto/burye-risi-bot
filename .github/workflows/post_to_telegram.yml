@@ -3,8 +3,11 @@ name: post-to-telegram
 on:
   schedule:
     # Время в UTC (МСК = UTC+3, без перехода на летнее/зимнее время).
-    - cron: '0 15 * * 5'  # пятница 18:00 МСК -> анонс игры(игр) на выходные
-    - cron: '0 10 * * 1'  # понедельник 13:00 МСК -> итоги прошедшей игры (с фото)
+    # Минуты специально НЕ 00 -- GitHub официально предупреждает, что
+    # запуски ровно в начале часа чаще задерживаются из-за перегрузки
+    # (см. https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule).
+    - cron: '5 15 * * 5'  # пятница ~18:05 МСК -> анонс игры(игр) на выходные
+    - cron: '5 10 * * 1'  # понедельник ~13:05 МСК -> итоги прошедшей игры (с фото)
   workflow_dispatch:
     inputs:
       mode:
@@ -39,9 +42,9 @@ jobs:
       - name: Determine mode
         id: mode
         run: |
-          if [ "${{ github.event.schedule }}" = "0 15 * * 5" ]; then
+          if [ "${{ github.event.schedule }}" = "5 15 * * 5" ]; then
             echo "mode=announce" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 10 * * 1" ]; then
+          elif [ "${{ github.event.schedule }}" = "5 10 * * 1" ]; then
             echo "mode=recap" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode || 'announce' }}" >> "$GITHUB_OUTPUT"
