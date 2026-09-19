@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import json
+import time
 import argparse
 from datetime import datetime, timedelta, timezone
 
@@ -194,15 +195,25 @@ def fetch_top_players_block(game_url, timeout_ms=30000):
 
     protocol_url = game_url.rstrip("/") + "/protocol"
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
+        text = None
+        last_error = None
+        for attempt in range(1, 3):  # 1 повтор при обычном сетевом сбое
             try:
-                page = browser.new_page(viewport={"width": 1400, "height": 2000})
-                page.goto(protocol_url, wait_until="networkidle", timeout=timeout_ms)
-                page.wait_for_timeout(3000)
-                text = page.inner_text("body")
-            finally:
-                browser.close()
+                with sync_playwright() as p:
+                    browser = p.chromium.launch()
+                    try:
+                        page = browser.new_page(viewport={"width": 1400, "height": 2000})
+                        page.goto(protocol_url, wait_until="networkidle", timeout=timeout_ms)
+                        page.wait_for_timeout(3000)
+                        text = page.inner_text("body")
+                    finally:
+                        browser.close()
+                break
+            except Exception as e:
+                last_error = e
+                print(f"WARN: попытка {attempt}/2 открыть {protocol_url} не удалась: {e}", file=sys.stderr)
+        if text is None:
+            raise last_error
 
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         teams = parse_protocol_player_stats(lines)
@@ -228,13 +239,29 @@ def fetch_top_players_block(game_url, timeout_ms=30000):
         return None
 
 
-def fetch_team_page():
-    resp = requests.get(TEAM_URL, headers=HEADERS, timeout=20)
-    print(f"DEBUG: HTTP status = {resp.status_code}")
-    print(f"DEBUG: HTML length = {len(resp.text)}")
-    print(f"DEBUG: HTML start = {resp.text[:500]!r}")
-    resp.raise_for_status()
-    return resp.text
+def fetch_team_page(retries=3, backoff_seconds=8):
+    """Скачать страницу команды с несколькими попытками -- ABL иногда
+    просто не отвечает вовремя (обычный разовый сетевой сбой), и без
+    повторов бот в этом случае ничего не постит до следующего расписания."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(TEAM_URL, headers=HEADERS, timeout=30)
+            print(f"DEBUG: HTTP status = {resp.status_code}")
+            print(f"DEBUG: HTML length = {len(resp.text)}")
+            print(f"DEBUG: HTML start = {resp.text[:500]!r}")
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            last_error = e
+            print(
+                f"WARN: попытка {attempt}/{retries} получить страницу команды "
+                f"не удалась: {e}",
+                file=sys.stderr,
+            )
+            if attempt < retries:
+                time.sleep(backoff_seconds)
+    raise last_error
 
 
 def extract_lines(a_tag):
@@ -500,27 +527,34 @@ def screenshot_game_card(href_path, timeout_ms=30000):
     """
     from playwright.sync_api import sync_playwright
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
+    last_error = None
+    for attempt in range(1, 3):  # 1 повтор при обычном сетевом сбое
         try:
-            # device_scale_factor рендерит страницу в более высоком
-            # разрешении (как экран "retina"), а не просто растягивает
-            # готовую картинку -- поэтому лого и текст на карточке
-            # получаются чёткими, а не размытыми при увеличении.
-            page = browser.new_page(
-                viewport={"width": 1280, "height": 1600},
-                device_scale_factor=3,
-            )
-            page.goto(TEAM_URL, wait_until="networkidle", timeout=timeout_ms)
-            locator = page.locator(f'a[href="{href_path}"]').first
-            locator.wait_for(state="visible", timeout=timeout_ms)
-            locator.scroll_into_view_if_needed()
-            # даём время дорисоваться лого команд (они у ABL иногда
-            # подгружаются с небольшой задержкой уже после networkidle)
-            page.wait_for_timeout(1000)
-            return locator.screenshot()
-        finally:
-            browser.close()
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                try:
+                    # device_scale_factor рендерит страницу в более высоком
+                    # разрешении (как экран "retina"), а не просто растягивает
+                    # готовую картинку -- поэтому лого и текст на карточке
+                    # получаются чёткими, а не размытыми при увеличении.
+                    page = browser.new_page(
+                        viewport={"width": 1280, "height": 1600},
+                        device_scale_factor=3,
+                    )
+                    page.goto(TEAM_URL, wait_until="networkidle", timeout=timeout_ms)
+                    locator = page.locator(f'a[href="{href_path}"]').first
+                    locator.wait_for(state="visible", timeout=timeout_ms)
+                    locator.scroll_into_view_if_needed()
+                    # даём время дорисоваться лого команд (они у ABL иногда
+                    # подгружаются с небольшой задержкой уже после networkidle)
+                    page.wait_for_timeout(1000)
+                    return locator.screenshot()
+                finally:
+                    browser.close()
+        except Exception as e:
+            last_error = e
+            print(f"WARN: попытка {attempt}/2 сделать скриншот карточки не удалась: {e}", file=sys.stderr)
+    raise last_error
 
 
 def send_telegram_message(token, text):
