@@ -19,11 +19,10 @@
     Если ABL поменяет вёрстку, парсер может перестать находить игры --
     в этом случае скрипт просто ничего не публикует (см. safe-guard ниже)
     и это будет видно в логах workflow-запуска на GitHub.
-  - Автоматическая публикация фото пока НЕ реализована: у ABL нет надёжного
-    отдельного фотогалереи с привязкой к матчу (в основном видео), а постить
-    случайные/неверные картинки в канал клуба -- плохая идея. Если у клуба
-    есть свой источник фото (Google Drive, Я.Диск и т.п.), это можно добавить
-    отдельно.
+  - К каждому посту прикладывается скриншот карточки игры с сайта ABL
+    (см. screenshot_game_card) -- рендерится в 3x разрешении для чёткости.
+    Если скриншот не удаётся сделать, бот присылает обычный текст вместо
+    того, чтобы промолчать (см. build_announce_text / build_recap_fallback_text).
 """
 
 import os
@@ -504,11 +503,21 @@ def screenshot_game_card(href_path, timeout_ms=30000):
     with sync_playwright() as p:
         browser = p.chromium.launch()
         try:
-            page = browser.new_page(viewport={"width": 1280, "height": 1600})
+            # device_scale_factor рендерит страницу в более высоком
+            # разрешении (как экран "retina"), а не просто растягивает
+            # готовую картинку -- поэтому лого и текст на карточке
+            # получаются чёткими, а не размытыми при увеличении.
+            page = browser.new_page(
+                viewport={"width": 1280, "height": 1600},
+                device_scale_factor=3,
+            )
             page.goto(TEAM_URL, wait_until="networkidle", timeout=timeout_ms)
             locator = page.locator(f'a[href="{href_path}"]').first
             locator.wait_for(state="visible", timeout=timeout_ms)
             locator.scroll_into_view_if_needed()
+            # даём время дорисоваться лого команд (они у ABL иногда
+            # подгружаются с небольшой задержкой уже после networkidle)
+            page.wait_for_timeout(1000)
             return locator.screenshot()
         finally:
             browser.close()
