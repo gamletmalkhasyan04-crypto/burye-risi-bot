@@ -6,8 +6,8 @@ on:
     # Минуты специально НЕ 00 -- GitHub официально предупреждает, что
     # запуски ровно в начале часа чаще задерживаются из-за перегрузки
     # (см. https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#schedule).
-    - cron: '5 15 * * 5'  # пятница ~18:05 МСК -> анонс игры(игр) на выходные
-    - cron: '5 10 * * 1'  # понедельник ~13:05 МСК -> итоги прошедшей игры (с фото)
+    - cron: '1 15 * * 5'  # пятница ~18:01 МСК -> анонс игры(игр) на выходные
+    - cron: '1 10 * * 1'  # понедельник ~13:01 МСК -> итоги прошедшей игры (с фото)
   workflow_dispatch:
     inputs:
       mode:
@@ -42,9 +42,9 @@ jobs:
       - name: Determine mode
         id: mode
         run: |
-          if [ "${{ github.event.schedule }}" = "5 15 * * 5" ]; then
+          if [ "${{ github.event.schedule }}" = "1 15 * * 5" ]; then
             echo "mode=announce" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "5 10 * * 1" ]; then
+          elif [ "${{ github.event.schedule }}" = "1 10 * * 1" ]; then
             echo "mode=recap" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode || 'announce' }}" >> "$GITHUB_OUTPUT"
@@ -53,6 +53,9 @@ jobs:
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # Необязательно -- если секрета нет, бот просто использует более
+          # простой фиксированный текст поста вместо живого от Claude.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && '1' || '' }}
         run: python bot.py --mode ${{ steps.mode.outputs.mode }}
 
