@@ -12,6 +12,17 @@
 Переменные окружения:
   TELEGRAM_BOT_TOKEN  -- токен бота (обязательно)
   DRY_RUN=1           -- собрать и напечатать пост, но не отправлять в Telegram
+  ANTHROPIC_API_KEY   -- необязательно. Если задан, живой текст поста
+                         (заголовок/вступление/концовка) пишет Claude под
+                         конкретный случай (соперник/результат/лидеры матча).
+                         Если не задан или запрос не удался -- пост всё
+                         равно уходит, но с более простым фиксированным
+                         текстом (см. ANNOUNCE_SYSTEM_PROMPT/RECAP_SYSTEM_PROMPT
+                         и *_static ниже). Модель по умолчанию задаётся
+                         CLAUDE_TEXT_MODEL -- поменяйте, если понадобится
+                         (см. https://docs.claude.com/en/docs/about-claude/models).
+  CLAUDE_TEXT_MODEL   -- необязательно, id модели для генерации текста
+                         (по умолчанию см. CLAUDE_TEXT_MODEL ниже в коде)
 
 Заметки / известные ограничения:
   - Сайт ABL не отдаёт публичного JSON API, поэтому парсинг идёт по HTML
@@ -186,10 +197,10 @@ def pick_top_players(players, top_n=TOP_PLAYERS_N):
 TOP_PLAYER_MEDALS = ["🥇", "🥈", "🥉", "4.", "5."]
 
 
-def fetch_top_players_block(game_url, timeout_ms=30000):
-    """Открыть /protocol данной игры и вернуть готовый текстовый блок
-    "Топ-3 игрока: ..." для TEAM_NAME, либо None, если что-то пошло не так
-    (страница не открылась, не нашли команду и т.п.) -- recap в этом
+def fetch_top_players(game_url, timeout_ms=30000):
+    """Открыть /protocol данной игры и вернуть список топ-N игроков
+    TEAM_NAME (сырые dict со статистикой), либо None, если что-то пошло не
+    так (страница не открылась, не нашли команду и т.п.) -- recap в этом
     случае просто уйдёт без блока статистики, а не сломается целиком."""
     from playwright.sync_api import sync_playwright
 
@@ -225,18 +236,223 @@ def fetch_top_players_block(game_url, timeout_ms=30000):
                 file=sys.stderr,
             )
             return None
-
-        top = pick_top_players(our_players)
-        out = [f"⭐ Топ-{len(top)} игрока «{TEAM_NAME}»:"]
-        for medal, p in zip(TOP_PLAYER_MEDALS, top):
-            out.append(
-                f"{medal} {p['name']} — {p['pts']} очк., {p['reb_tot']} подб., "
-                f"{p['ast']} пер., эфф. {p['eff']}"
-            )
-        return "\n".join(out)
+        return pick_top_players(our_players)
     except Exception as e:
         print(f"WARN: не удалось получить статистику игроков для {protocol_url}: {e}", file=sys.stderr)
         return None
+
+
+# ----------------------------------------------------------------------------
+# Живой текст поста через Claude API (необязательно, см. ANTHROPIC_API_KEY
+# в шапке файла). Жёсткие факты (счёт, дата, имена, цифры статистики)
+# ВСЕГДА собираются кодом отдельно и не отдаются модели на откуп -- в
+# промпт эти факты передаются готовыми, а модель пишет только заголовок/
+# вступление/концовку. Так пост не может случайно получить придуманную
+# статистику или серию побед, даже если модель что-то перепутает.
+# ----------------------------------------------------------------------------
+
+CLAUDE_TEXT_MODEL = os.environ.get("CLAUDE_TEXT_MODEL", "claude-3-5-sonnet-20241022")
+
+STYLE_NOTE = (
+    "Ты ведёшь Telegram-канал баскетбольной команды-любителей «Бурые Рыси» "
+    "(лига ABL). Пиши по-русски, энергично, гордо и тепло, как капитан "
+    "команды обращается к своим болельщикам: короткие ударные фразы, "
+    "обращение \"мы\", немного эмодзи (🔥🐾🏀💪⚡🎯🎉 и похожие, не больше "
+    "4-5 на весь текст), никакого канцелярита и никаких хэштегов (их "
+    "добавляют отдельно). Используй ТОЛЬКО факты, которые даны в запросе -- "
+    "никогда не придумывай счёт, статистику, место в таблице или серию игр, "
+    "которых там нет."
+)
+
+AI_SECTION_KEYS = ["TITLE", "INTRO", "OUTRO"]
+
+ANNOUNCE_SYSTEM_PROMPT = (
+    STYLE_NOTE + "\n\n"
+    "Сейчас нужно написать пост-анонс перед игрой (уходит в пятницу перед "
+    "выходными). Он должен заряжать болельщиков перед матчем.\n\n"
+    "Ответь СТРОГО в этом формате и больше ничего не пиши:\n"
+    "TITLE: короткий яркий заголовок с эмодзи по краям (одна строка)\n"
+    "INTRO: 2-4 предложения куража перед игрой, не больше ~350 символов\n"
+    "OUTRO: одна короткая кричалка-призыв поддержать команду, не больше ~80 символов"
+)
+
+RECAP_SYSTEM_PROMPT = (
+    STYLE_NOTE + "\n\n"
+    "Сейчас нужно написать пост-итог после сыгранного матча (уходит в "
+    "понедельник). Опиши, как прошла игра, опираясь только на данные "
+    "результата и лидеров матча из запроса.\n\n"
+    "Ответь СТРОГО в этом формате и больше ничего не пиши:\n"
+    "TITLE: короткий яркий заголовок с эмодзи по краям (одна строка)\n"
+    "INTRO: 2-4 предложения о том, как прошла игра, не больше ~350 символов\n"
+    "OUTRO: одна короткая фраза-итог/призыв, не больше ~80 символов"
+)
+
+
+def call_claude_for_copy(system_prompt, user_prompt, max_tokens=500):
+    """Запросить у Claude API живой текст поста. Возвращает сырой текст
+    ответа или None при любой проблеме (нет ключа, сеть, статус, пустой
+    ответ) -- вызывающий код в этом случае просто берёт запасной
+    статический текст, публикация никогда не блокируется этим шагом."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_TEXT_MODEL,
+                "max_tokens": max_tokens,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = "".join(
+            part.get("text", "") for part in data.get("content", [])
+            if part.get("type") == "text"
+        )
+        return text.strip() or None
+    except Exception as e:
+        print(f"WARN: вызов Claude API не удался, беру запасной текст: {e}", file=sys.stderr)
+        return None
+
+
+def parse_ai_sections(text, keys=AI_SECTION_KEYS):
+    """Достать TITLE:/INTRO:/OUTRO: из ответа модели. Возвращает dict
+    только если ВСЕ нужные секции нашлись и не пустые -- иначе None, и
+    вызывающий код падает обратно на статический текст (лучше простой
+    пост, чем обрезанный/сломанный AI-текст)."""
+    if not text:
+        return None
+    alt = "|".join(keys)
+    pattern = re.compile(
+        rf"^(?:{alt}):\s*(.*?)(?=^(?:{alt}):|\Z)", re.MULTILINE | re.DOTALL
+    )
+    labels = re.findall(rf"^({alt}):", text, re.MULTILINE)
+    values = pattern.findall(text)
+    result = {
+        label: value.strip()
+        for label, value in zip(labels, values)
+    }
+    if all(result.get(k) for k in keys):
+        return result
+    return None
+
+
+def compute_team_form(games, upto_dt=None):
+    """Факты о недавней форме команды по уже сыгранным играм, которые
+    реально нашлись на странице команды (это может быть неполная история
+    сезона, если сайт что-то не показывает -- поэтому наружу отдаём только
+    текущую серию побед/поражений, а не итоговый счёт побед за сезон,
+    который легко может оказаться неполным/неверным).
+
+    upto_dt -- учитывать только игры до этого момента включительно
+    (для анонса -- без самой предстоящей игры; для recap -- включая
+    только что сыгранную). Возвращает None, если сыгранных игр не нашлось."""
+    cutoff = upto_dt or datetime.now(MSK)
+    played = [
+        g for g in games
+        if team_involved(g) and not is_upcoming(g) and g["datetime"] <= cutoff
+    ]
+    if not played:
+        return None
+    played.sort(key=lambda g: g["datetime"])
+
+    results = []
+    for g in played:
+        if g["team_a"] == TEAM_NAME:
+            us, opp = g["score_a"], g["score_b"]
+        else:
+            us, opp = g["score_b"], g["score_a"]
+        results.append("W" if us > opp else ("L" if us < opp else "D"))
+
+    streak_type = results[-1]
+    streak_count = 0
+    for r in reversed(results):
+        if r == streak_type:
+            streak_count += 1
+        else:
+            break
+    return {"games_known": len(played), "streak_type": streak_type, "streak_count": streak_count}
+
+
+def form_hint_line(form):
+    """Одна строка с формой команды для промпта, только если серия из 2+
+    игр -- иначе пусто (не стоит упоминания)."""
+    if not form or form["streak_count"] < 2:
+        return ""
+    word = {"W": "побед", "L": "поражений", "D": "ничьих"}[form["streak_type"]]
+    return f"Наша текущая серия (по последним известным играм): {form['streak_count']} {word} подряд.\n"
+
+
+def player_highlights(p):
+    """Заметные достижения игрока, которые можно честно посчитать по уже
+    распарсенным цифрам (не выдумка модели, а код) -- дабл-дабл/трипл-дабл,
+    идеальная точность из-за дуги при разумном числе попыток."""
+    try:
+        pts, reb, ast = int(p["pts"]), int(p["reb_tot"]), int(p["ast"])
+        stl, blk = int(p["stl"]), int(p["blk"])
+        fg3_m, fg3_a = int(p["fg3_m"]), int(p["fg3_a"])
+    except (KeyError, ValueError):
+        return []
+    highlights = []
+    doubles = sum(1 for v in (pts, reb, ast, stl, blk) if v >= 10)
+    if doubles >= 3:
+        highlights.append("трипл-дабл")
+    elif doubles == 2:
+        highlights.append("дабл-дабл")
+    if fg3_a >= 3 and fg3_m == fg3_a:
+        highlights.append(f"{fg3_m}/{fg3_a} трёхочковых")
+    return highlights
+
+
+def format_top_players_block(top_players):
+    out = ["🎯 Лидеры матча:"]
+    for medal, p in zip(TOP_PLAYER_MEDALS, top_players):
+        bits = f"{p['pts']} очков, {p['reb_tot']} подборов, {p['ast']} передач"
+        hl = player_highlights(p)
+        if hl:
+            bits += " (" + ", ".join(hl) + ")"
+        out.append(f"{medal} {p['name']}: {bits}")
+    return "\n".join(out)
+
+
+def generate_announce_ai(g, form):
+    opponent = g["team_b"] if g["team_a"] == TEAM_NAME else g["team_a"]
+    user_prompt = (
+        f"Соперник: {opponent}\n"
+        f"Дата и время: {fmt_date(g['datetime'])}, {g['datetime'].strftime('%H:%M')} МСК\n"
+        f"{g['round']} ({g['division']})\n"
+        f"{form_hint_line(form)}"
+        f"Не упоминай точное место/адрес проведения и не выдумывай его -- "
+        f"в посте и так будет ссылка с деталями."
+    )
+    return parse_ai_sections(call_claude_for_copy(ANNOUNCE_SYSTEM_PROMPT, user_prompt))
+
+
+def generate_recap_ai(g, our_score, opp_score, opponent, result_word, top_players, form):
+    player_lines = []
+    for p in top_players:
+        hl = player_highlights(p)
+        extra = f" ({', '.join(hl)})" if hl else ""
+        player_lines.append(
+            f"- {p['name']}: {p['pts']} очков, {p['reb_tot']} подборов, "
+            f"{p['ast']} передач, эффективность {p['eff']}{extra}"
+        )
+    user_prompt = (
+        f"Результат: {result_word} {our_score}:{opp_score} против {opponent}\n"
+        f"{g['round']} ({g['division']})\n"
+        f"Лидеры матча:\n" + "\n".join(player_lines) + "\n"
+        f"{form_hint_line(form)}"
+    )
+    return parse_ai_sections(call_claude_for_copy(RECAP_SYSTEM_PROMPT, user_prompt))
 
 
 def fetch_team_page(retries=3, backoff_seconds=8):
@@ -419,7 +635,13 @@ def select_played(games):
     return played
 
 
-def game_caption_announce(g):
+TELEGRAM_CAPTION_SAFE_LIMIT = 1000  # у Telegram лимит 1024 на подпись к фото
+
+
+def game_caption_announce_static(g):
+    """Фиксированный текст без Claude -- запасной вариант, если
+    ANTHROPIC_API_KEY не задан, запрос не удался или AI-текст не прошёл
+    проверку формата/длины."""
     opponent = g["team_b"] if g["team_a"] == TEAM_NAME else g["team_a"]
     return (
         f"🏀 {TEAM_NAME} — {opponent}\n"
@@ -430,21 +652,30 @@ def game_caption_announce(g):
     )
 
 
-def game_caption_recap(g, stats_block=None):
-    if g["team_a"] == TEAM_NAME:
-        our_score, opp_score, opponent = g["score_a"], g["score_b"], g["team_b"]
-    else:
-        our_score, opp_score, opponent = g["score_b"], g["score_a"], g["team_a"]
+def game_caption_announce(g, form):
+    facts = f"📅 {fmt_date(g['datetime'])}, {g['datetime'].strftime('%H:%M')} МСК\n🏆 {g['round']} ({g['division']})"
+    ai = generate_announce_ai(g, form)
+    if ai:
+        caption = f"{ai['TITLE']}\n\n{ai['INTRO']}\n\n{facts}\n\n{ai['OUTRO']}\n{g['url']}"
+        if len(caption) <= TELEGRAM_CAPTION_SAFE_LIMIT:
+            return caption
+        print("WARN: AI-текст анонса вышел за лимит длины, беру запасной", file=sys.stderr)
+    return game_caption_announce_static(g)
 
+
+def result_word_and_emoji(our_score, opp_score):
     if our_score > opp_score:
-        result = "🟢 Победа"
-    elif our_score < opp_score:
-        result = "🔴 Поражение"
-    else:
-        result = "⚪ Ничья"
+        return "Победа", "🟢"
+    if our_score < opp_score:
+        return "Поражение", "🔴"
+    return "Ничья", "⚪"
 
+
+def game_caption_recap_static(g, stats_block):
+    our_score, opp_score, opponent = recap_scores(g)
+    result, emoji = result_word_and_emoji(our_score, opp_score)
     header = (
-        f"{result}\n"
+        f"{emoji} {result}\n"
         f"🏀 {TEAM_NAME} {our_score}:{opp_score} {opponent}\n"
         f"🏆 {g['round']} ({g['division']}) · {fmt_date(g['datetime'])}"
     )
@@ -452,21 +683,53 @@ def game_caption_recap(g, stats_block=None):
     return f"{header}{stats_part}\n\n{g['url']}\n\n#БурыеРыси #ABL"
 
 
+def recap_scores(g):
+    if g["team_a"] == TEAM_NAME:
+        return g["score_a"], g["score_b"], g["team_b"]
+    return g["score_b"], g["score_a"], g["team_a"]
+
+
+def game_caption_recap(g, top_players, form):
+    our_score, opp_score, opponent = recap_scores(g)
+    result, emoji = result_word_and_emoji(our_score, opp_score)
+    stats_block = format_top_players_block(top_players) if top_players else None
+
+    if top_players:
+        ai = generate_recap_ai(g, our_score, opp_score, opponent, result, top_players, form)
+        if ai:
+            facts = f"📊 Итог встречи:\n«{TEAM_NAME}» {our_score} : {opp_score} {opponent}"
+            parts = [ai["TITLE"], "", ai["INTRO"], "", facts]
+            if stats_block:
+                parts += ["", stats_block]
+            parts += ["", ai["OUTRO"], g["url"], "", "#БурыеРыси #ABL"]
+            caption = "\n".join(parts)
+            if len(caption) <= TELEGRAM_CAPTION_SAFE_LIMIT:
+                return caption
+            print("WARN: AI-текст итогов вышел за лимит длины, беру запасной", file=sys.stderr)
+
+    return game_caption_recap_static(g, stats_block)
+
+
 def build_announce_items(games):
     """Список (игра, подпись) для всех предстоящих игр на ближайшие 7 дней --
     по одной карточке-фото на каждую игру."""
-    return [(g, game_caption_announce(g)) for g in select_upcoming(games)]
+    items = []
+    for g in select_upcoming(games):
+        form = compute_team_form(games, upto_dt=g["datetime"])
+        items.append((g, game_caption_announce(g, form)))
+    return items
 
 
 def build_recap_items(games):
     """Список (игра, подпись) для всех сыгранных за последние 7 дней игр.
     Для каждой игры дополнительно пытаемся достать топ-3 игрока "Бурые
     Рыси" со страницы /protocol -- если не получится, подпись просто
-    уйдёт без этого блока (см. fetch_top_players_block)."""
+    уйдёт без этого блока (см. fetch_top_players)."""
     items = []
     for g in select_played(games):
-        stats_block = fetch_top_players_block(g["url"])
-        items.append((g, game_caption_recap(g, stats_block)))
+        top_players = fetch_top_players(g["url"])
+        form = compute_team_form(games, upto_dt=g["datetime"])
+        items.append((g, game_caption_recap(g, top_players, form)))
     return items
 
 
